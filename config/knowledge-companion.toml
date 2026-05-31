@@ -1,0 +1,49 @@
+[app]
+name = "KnowledgeCompanion"
+sync_interval_seconds = 300
+max_file_size_mb = 50
+log_level = "info"
+
+[storage]
+db_path = "./data/knowledge.db"
+cache_dir = "./data/cache"
+log_dir = "./data/logs"
+
+[[knowledge.roots]]
+name = "usb"
+path = "./knowledge"
+enabled = true
+read_only = true
+include_globs = ["**/*.md", "**/*.markdown", "**/*.txt", "**/*.pdf", "**/*.docx"]
+exclude_globs = ["**/.git/**", "**/.svn/**", "**/node_modules/**", "**/target/**", "**/.env", "**/.obsidian/workspace*.json"]
+
+[llm]
+enabled = false
+base_url = "https://api.openai.com/v1"
+api_key_env = "KC_LLM_API_KEY"
+model_qa = "gpt-4.1-mini"
+model_translate = "gpt-4.1-mini"
+timeout_seconds = 60
+
+[embedding]
+enabled = true
+base_url = "https://api.siliconflow.cn/v1"
+api_key_env = "KC_EMBED_API_KEY"
+model = "BAAI/bge-m3"
+dimensions = 1024
+timeout_seconds = 60
+batch_size = 16
+
+[retrieval]
+vector_backend = "rust_cosine"
+top_k = 12
+chunk_target_tokens = 650
+chunk_overlap_tokens = 80
+
+[http_mcp]
+enabled = false
+bind = "127.0.0.1"
+port = 18791
+token_env = "KC_HTTP_MCP_TOKEN"
+requests_per_minute = 60
+timeout_seconds = 120
