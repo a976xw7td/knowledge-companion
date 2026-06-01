@@ -4,6 +4,8 @@
 //! The folder is the source of truth; the database stores derived indexes.
 
 pub mod executor;
+pub mod indexer;
+pub mod jobs;
 pub mod planner;
 pub mod scanner;
 pub mod watcher;
@@ -12,7 +14,11 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// Global sync mutex — prevents concurrent sync operations.
+static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 use crate::config::KnowledgeRoot;
 
@@ -33,6 +39,7 @@ pub fn sync_root(
     conn: &Connection,
     root: &KnowledgeRoot,
     bundle_root: &Path,
+    max_file_size_bytes: u64,
 ) -> Result<SyncResult> {
     let start = Instant::now();
 
@@ -60,8 +67,8 @@ pub fn sync_root(
     let files = scanner::scan(&root_path, &root.include_globs, &root.exclude_globs)?;
     tracing::debug!(file_count = files.len(), "Scan complete");
 
-    // 2. Plan
-    let plan = planner::build_plan(conn, root, &root_path, &files)?;
+    // 2. Plan (checks file size limit before hashing)
+    let plan = planner::build_plan(conn, root, &root_path, &files, max_file_size_bytes)?;
     tracing::debug!(
         create = plan.create.len(),
         modify = plan.modify.len(),
@@ -97,16 +104,29 @@ pub fn sync_root(
     })
 }
 
-/// Run sync for all enabled roots.
+/// Run sync for all enabled roots. Only one sync at a time.
 pub fn sync_all(conn: &Connection, bundle_root: &Path) -> Result<Vec<SyncResult>> {
+    if SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return Err(anyhow::anyhow!("Sync is already in progress"));
+    }
+    // Clear flag on drop (even on panic)
+    struct SyncGuard;
+    impl Drop for SyncGuard {
+        fn drop(&mut self) {
+            SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = SyncGuard;
+
     let config = crate::config::bundle::load_config(bundle_root).unwrap_or_default();
+    let max_file_size_bytes = config.app.max_file_size_mb * 1_048_576u64;
     let mut results = Vec::new();
 
     for root in &config.knowledge.roots {
         if !root.enabled {
             continue;
         }
-        match sync_root(conn, root, bundle_root) {
+        match sync_root(conn, root, bundle_root, max_file_size_bytes) {
             Ok(result) => results.push(result),
             Err(e) => {
                 tracing::error!(error = %e, root = %root.name, "Sync failed for root");

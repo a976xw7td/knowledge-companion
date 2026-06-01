@@ -57,8 +57,23 @@ pub fn ask_question(
     fts_available: bool,
     query_embedding: Option<&[f32]>,
 ) -> Result<RagAnswer> {
-    let (items, diagnostics) =
+    let (mut items, mut diagnostics) =
         retrieve::hybrid_search(conn, question, top_k, fts_available, query_embedding, true)?;
+
+    // If degraded or too few results, retry with just the entity keywords
+    if diagnostics.degraded || items.len() < 2 {
+        let simple = question
+            .split(['的', '是', '在', '？', '?'])
+            .next()
+            .unwrap_or(question)
+            .trim();
+        if simple.len() < question.len() {
+            let (items2, diag2) =
+                retrieve::hybrid_search(conn, simple, top_k, fts_available, None, true)?;
+            items.extend(items2);
+            diagnostics = diag2;
+        }
+    }
 
     let sources: Vec<SourceRef> = items
         .iter()
@@ -80,17 +95,37 @@ pub fn ask_question(
         .map(|s| citations::Citation::new(&s.source_id, &s.title, &s.source_path))
         .collect();
 
-    // Build context for LLM
-    let context: String = sources
-        .iter()
-        .map(|s| {
-            format!(
-                "[{}] ({}) {}: {}",
-                s.source_id, s.source_path, s.title, s.excerpt
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    // Build context for LLM — limit chunks and chars
+    const MAX_CONTEXT_CHARS: usize = 12000;
+    const MAX_CONTEXT_CHUNKS: usize = 15;
+    let sources = if sources.len() > MAX_CONTEXT_CHUNKS {
+        sources[..MAX_CONTEXT_CHUNKS].to_vec()
+    } else {
+        sources
+    };
+    let context: String = {
+        let mut ctx = String::new();
+        for s in &sources {
+            if ctx.len() >= MAX_CONTEXT_CHARS {
+                break;
+            }
+            let content = conn
+                .query_row(
+                    "SELECT coalesce(content, '') FROM chunks WHERE id = ?1",
+                    rusqlite::params![&s.chunk_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| "[...]".to_string());
+            let block = format!("[{}] ({}): {}\n\n", s.source_id, s.source_path, content);
+            if ctx.len() + block.len() > MAX_CONTEXT_CHARS {
+                ctx.push_str(&block[..(MAX_CONTEXT_CHARS - ctx.len()).min(100)]);
+                ctx.push_str("...");
+                break;
+            }
+            ctx.push_str(&block);
+        }
+        ctx
+    };
 
     // Try LLM if configured
     if let Some(cfg) = llm_config {

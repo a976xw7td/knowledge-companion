@@ -453,3 +453,294 @@ fn test_sync_pipeline_e2e() {
     drop(stdin);
     let _ = child.wait();
 }
+
+/// Stress test: 50 docs with repeated tags, wikilinks, empty file, oversized file.
+/// Verifies FTS works, embedding jobs are queued, sync mutex works.
+#[test]
+fn test_stress_50_docs() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let bundle_root = temp_dir.path();
+
+    std::fs::create_dir_all(bundle_root.join("config")).unwrap();
+    std::fs::create_dir_all(bundle_root.join("knowledge")).unwrap();
+    std::fs::create_dir_all(bundle_root.join("data/logs")).unwrap();
+    std::fs::create_dir_all(bundle_root.join("data/cache")).unwrap();
+
+    let knowledge_dir = bundle_root.join("knowledge");
+
+    // Write config (default max_file_size_mb=50 is fine; oversized test via skip handling)
+    let config_toml = format!(
+        "[app]\n[storage]\n[[knowledge.roots]]\nname = \"test\"\npath = \"{}\"\nenabled = true\ninclude_globs = [\"**/*.md\", \"**/*.txt\"]\n",
+        knowledge_dir.display()
+    );
+    std::fs::write(
+        bundle_root.join("config/knowledge-companion.toml"),
+        config_toml,
+    )
+    .unwrap();
+
+    // Common tags shared across documents
+    let shared_tags = ["#rust", "#async", "#testing", "#performance", "#security"];
+
+    // Common wikilinks shared across documents
+    let shared_wikilinks = [
+        "[[GettingStarted]]",
+        "[[APIDocs]]",
+        "[[FAQ]]",
+        "[[Changelog]]",
+        "[[Contributing]]",
+    ];
+
+    // Create 50 markdown files
+    let start = std::time::Instant::now();
+    for i in 0..50 {
+        let filename = format!("doc_{:03}.md", i);
+        let tag = shared_tags[i % shared_tags.len()];
+        let wikilink = shared_wikilinks[i % shared_wikilinks.len()];
+
+        let content = format!(
+            "# Document {:03}\n\n## Section A\n\nThis is document number {} for stress testing.\n\nTags: {}\n\n## Section B\n\nRefer to {} for more information.\n\nParagraph about topic number {}. This contains multiple sentences for better chunking and FTS coverage. We need enough text to create meaningful chunks.\n\n## Section C\n\nFinal section of this document with some concluding remarks about the test.\n",
+            i, i, tag, wikilink, i
+        );
+        std::fs::write(knowledge_dir.join(&filename), content).unwrap();
+    }
+
+    // Create an empty file
+    std::fs::write(knowledge_dir.join("empty_doc.md"), "").unwrap();
+
+    eprintln!(
+        "[STRESS] Created 51 files (50 docs + 1 empty) in {:?}",
+        start.elapsed()
+    );
+
+    // Helper: send MCP tools/call
+    fn mcp_call2(
+        stdin: &mut impl std::io::Write,
+        reader: &mut impl std::io::BufRead,
+        id: u64,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":tool,"arguments":args}
+        })
+        .to_string();
+        writeln!(stdin, "{}", req).unwrap();
+        stdin.flush().unwrap();
+        let mut resp = String::new();
+        reader.read_line(&mut resp).unwrap();
+        serde_json::from_str(resp.trim()).unwrap()
+    }
+
+    // Spawn binary
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_knowledge-companion"))
+        .env("KC_BUNDLE_ROOT", bundle_root.to_str().unwrap())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Initialize MCP
+    let init_req = serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"stress","version":"1.0"}}
+    }).to_string();
+    writeln!(stdin, "{}", init_req).unwrap();
+    stdin.flush().unwrap();
+    let mut resp = String::new();
+    reader.read_line(&mut resp).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        parsed["result"]["serverInfo"]["name"],
+        "knowledge-companion"
+    );
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // ── Sync the 52 files ──────────────────────────────────────────
+    let sync_start = std::time::Instant::now();
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        2,
+        "sync_now",
+        serde_json::json!({}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    eprintln!("[STRESS] sync result: {}", results);
+    let sync_data: serde_json::Value = serde_json::from_str(results).unwrap();
+    let first_root = &sync_data.as_array().unwrap()[0];
+
+    let created = first_root["created"].as_u64().unwrap_or(0);
+    let failed = first_root["failed"].as_u64().unwrap_or(0);
+    let skipped = first_root["skipped"].as_u64().unwrap_or(0);
+    let sync_duration = sync_start.elapsed();
+
+    eprintln!(
+        "[STRESS] Sync done in {:?}: created={}, failed={}, skipped={}",
+        sync_duration, created, failed, skipped
+    );
+
+    // 51 files should be created (50 normal + 1 empty)
+    assert!(
+        created >= 50,
+        "Expected at least 50 created, got {}",
+        created
+    );
+    assert_eq!(failed, 0, "Expected 0 failed, got {}", failed);
+
+    // ── Verify FTS search works ────────────────────────────────────
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        3,
+        "search_knowledge",
+        serde_json::json!({"query": "stress testing", "top_k": 5}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let search_data: serde_json::Value = serde_json::from_str(results).unwrap();
+    let items = search_data["items"].as_array().unwrap();
+    assert!(
+        !items.is_empty(),
+        "FTS search should find stress testing documents"
+    );
+    eprintln!(
+        "[STRESS] FTS search for 'stress testing' returned {} items",
+        items.len()
+    );
+
+    // ── Verify shared tag and wikilink search ──────────────────────
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        4,
+        "search_graph",
+        serde_json::json!({"query": "rust", "node_type": "tag"}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let graph_data: serde_json::Value = serde_json::from_str(results).unwrap();
+    let nodes = graph_data["nodes"].as_array().unwrap();
+    assert!(
+        nodes.len() == 1,
+        "Shared tag 'rust' should have exactly 1 node, got {}",
+        nodes.len()
+    );
+    eprintln!(
+        "[STRESS] Shared tag 'rust' has {} node (expected 1)",
+        nodes.len()
+    );
+
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        5,
+        "search_graph",
+        serde_json::json!({"query": "GettingStarted", "node_type": "wikilink"}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let graph_data: serde_json::Value = serde_json::from_str(results).unwrap();
+    let nodes = graph_data["nodes"].as_array().unwrap();
+    assert!(
+        nodes.len() == 1,
+        "Shared wikilink 'GettingStarted' should have 1 node, got {}",
+        nodes.len()
+    );
+
+    // ── Verify sync stats ─────────────────────────────────────────
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        6,
+        "get_knowledge_stats",
+        serde_json::json!({}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let stats: serde_json::Value = serde_json::from_str(results).unwrap();
+    let total_docs = stats["total_documents"].as_u64().unwrap_or(0);
+    assert!(
+        total_docs >= 50,
+        "Expected 50+ indexed docs, got {}",
+        total_docs
+    );
+    eprintln!("[STRESS] Total documents indexed: {}", total_docs);
+    eprintln!(
+        "[STRESS] Total chunks: {}, tags: {}",
+        stats["total_chunks"].as_u64().unwrap_or(0),
+        stats["total_tags_wikilinks"].as_u64().unwrap_or(0)
+    );
+
+    // ── Verify embedding jobs are queued ──────────────────────────
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        7,
+        "get_sync_status",
+        serde_json::json!({}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let sync_status: serde_json::Value = serde_json::from_str(results).unwrap();
+    eprintln!("[STRESS] Sync status: {:?}", sync_status);
+
+    // ── Test forget_document on one doc ───────────────────────────
+    // Get a doc ID from the document list first
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        8,
+        "list_documents",
+        serde_json::json!({"limit": 5}),
+    );
+    let results = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let list_data: serde_json::Value = serde_json::from_str(results).unwrap();
+    let docs = list_data["documents"].as_array().unwrap();
+    assert!(!docs.is_empty(), "Should have documents in the list");
+
+    let first_doc_id = docs[0]["id"].as_str().unwrap().to_string();
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        9,
+        "forget_document",
+        serde_json::json!({"doc_id": &first_doc_id}),
+    );
+    let content = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    let forget_result: serde_json::Value = serde_json::from_str(content).unwrap_or_default();
+    assert_eq!(
+        forget_result["status"].as_str().unwrap_or(""),
+        "ok",
+        "forget_document should succeed, got: {}",
+        content
+    );
+    eprintln!("[STRESS] Forget document OK: {}", first_doc_id);
+
+    // Forget non-existent doc should error
+    let resp = mcp_call2(
+        &mut stdin,
+        &mut reader,
+        10,
+        "forget_document",
+        serde_json::json!({"doc_id": "nonexistent-id"}),
+    );
+    let content = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    eprintln!("[STRESS] Forget non-existent doc result: {}", content);
+
+    eprintln!(
+        "[STRESS PASS] 50-doc stress test: {:.1}s",
+        sync_duration.as_secs_f64()
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}

@@ -15,11 +15,18 @@ struct Migration {
 }
 
 /// All migrations in order. Add new entries at the end.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial",
-    sql: include_str!("../../migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial",
+        sql: include_str!("../../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_index_jobs",
+        sql: include_str!("../../migrations/0002_index_jobs.sql"),
+    },
+];
 
 /// Run pending migrations. Skips already-applied ones.
 pub fn run(conn: &Connection) -> Result<()> {

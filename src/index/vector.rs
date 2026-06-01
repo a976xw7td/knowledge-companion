@@ -2,6 +2,9 @@
 //!
 //! Supports remote embedding providers and local Rust cosine comparison.
 //! Default: Rust cosine over stored BLOB embeddings — no dynamic extensions.
+//!
+//! Corrupted or malformed BLOBs are skipped with a warning rather than
+//! causing the entire search to fail.
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -21,11 +24,49 @@ impl Embedding {
         self.vector.iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
-    /// Decode from BLOB.
-    pub fn from_blob(data: &[u8], model: &str, dimensions: usize) -> Self {
+    /// Decode from BLOB. Returns None if the BLOB is invalid.
+    /// - BLOB length must be a multiple of 4 (f32 = 4 bytes)
+    /// - Decoded float count must match `dimensions`
+    pub fn from_blob(data: &[u8], model: &str, dimensions: usize) -> Option<Self> {
+        // BLOB must be non-empty and aligned to 4-byte f32 boundary
+        if !data.len().is_multiple_of(4) {
+            tracing::warn!(
+                blob_len = data.len(),
+                "Embedding BLOB length not a multiple of 4; skipping corrupted entry"
+            );
+            return None;
+        }
+
+        let vector: Vec<f32> = data
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // If dimensions don't match expected, the BLOB is from a different model
+        if vector.len() != dimensions {
+            tracing::warn!(
+                expected = dimensions,
+                actual = vector.len(),
+                "Embedding dimension mismatch; skipping entry (likely from different model)"
+            );
+            return None;
+        }
+
+        Some(Self {
+            model: model.to_string(),
+            dimensions,
+            vector,
+        })
+    }
+
+    /// Legacy decode from BLOB. Maintains backward compatibility but
+    /// silently truncates/extends to match dimensions.
+    #[allow(dead_code)]
+    fn from_blob_legacy(data: &[u8], model: &str, dimensions: usize) -> Self {
         let vector: Vec<f32> = data
             .chunks(4)
             .take(dimensions)
+            .filter(|c| c.len() == 4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Self {
@@ -39,6 +80,16 @@ impl Embedding {
 /// Store an embedding for a chunk.
 pub fn store_embedding(conn: &Connection, chunk_id: &str, embedding: &Embedding) -> Result<()> {
     let blob = embedding.to_blob();
+    // Validate: blob length should be dimensions * 4
+    let expected_len = embedding.dimensions * 4;
+    if blob.len() != expected_len {
+        anyhow::bail!(
+            "Embedding BLOB length mismatch: expected {} bytes for {} dimensions, got {}",
+            expected_len,
+            embedding.dimensions,
+            blob.len()
+        );
+    }
     conn.execute(
         "INSERT OR REPLACE INTO chunk_embeddings (chunk_id, model, dimensions, embedding, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -49,6 +100,9 @@ pub fn store_embedding(conn: &Connection, chunk_id: &str, embedding: &Embedding)
 
 /// Cosine similarity between two f32 slices.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -60,6 +114,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Search embeddings by cosine similarity (in-memory Rust comparison).
+/// Corrupted BLOBs are skipped with a warning rather than causing errors.
 pub fn cosine_search(
     conn: &Connection,
     query_embedding: &Embedding,
@@ -80,10 +135,23 @@ pub fn cosine_search(
     })?;
 
     for row in rows {
-        let (chunk_id, model, dims, blob) = row?;
-        let emb = Embedding::from_blob(&blob, &model, dims as usize);
-        let score = cosine_similarity(&query_embedding.vector, &emb.vector);
-        scored.push((chunk_id, score));
+        let (chunk_id, model, dims, blob) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error=%e, "Failed to read embedding row; skipping");
+                continue;
+            }
+        };
+        match Embedding::from_blob(&blob, &model, dims as usize) {
+            Some(emb) => {
+                let score = cosine_similarity(&query_embedding.vector, &emb.vector);
+                scored.push((chunk_id, score));
+            }
+            None => {
+                // from_blob already logged a warning with details
+                continue;
+            }
+        }
     }
 
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -122,5 +190,52 @@ impl Embedder for NoopEmbedder {
     }
     fn model_name(&self) -> &str {
         "noop"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blob_roundtrip() {
+        let emb = Embedding {
+            model: "test".into(),
+            dimensions: 4,
+            vector: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let blob = emb.to_blob();
+        let decoded = Embedding::from_blob(&blob, "test", 4).unwrap();
+        assert_eq!(decoded.vector, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_blob_unaligned_length() {
+        // 3 bytes — not divisible by 4
+        let data = vec![0u8, 1, 2];
+        let result = Embedding::from_blob(&data, "test", 1);
+        assert!(result.is_none(), "Unaligned BLOB should return None");
+    }
+
+    #[test]
+    fn test_blob_dimension_mismatch() {
+        // 8 bytes = 2 floats, but we expect 3
+        let data = vec![0u8; 8];
+        let result = Embedding::from_blob(&data, "test", 3);
+        assert!(result.is_none(), "Dimension mismatch should return None");
+    }
+
+    #[test]
+    fn test_blob_empty() {
+        let data = vec![];
+        let result = Embedding::from_blob(&data, "test", 1);
+        assert!(result.is_none(), "Empty BLOB should return None");
+    }
+
+    #[test]
+    fn test_cosine_different_lengths() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
     }
 }

@@ -17,7 +17,6 @@ pub mod translate;
 
 use anyhow::Result;
 use db::connection;
-use index::fts;
 use mcp::adapter::StdioAdapter;
 use mcp::server::McpServer;
 use mcp::tools::{Tool, ToolRegistry, ToolResult};
@@ -230,17 +229,68 @@ impl Tool for RebuildIndexTool {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to open DB: {}", e)),
         };
-        // Wipe derived data
-        let _ = conn.execute("DELETE FROM chunk_embeddings", []);
-        let _ = conn.execute("DELETE FROM graph_edges", []);
-        let _ = conn.execute("DELETE FROM graph_nodes", []);
-        let _ = conn.execute("DELETE FROM chunks_fts", []);
-        let _ = conn.execute("DELETE FROM chunks", []);
-        let _ = conn.execute("DELETE FROM documents", []);
-        // Rebuild via full sync
+
+        // Backup DB before wiping
+        let db_path_clone = db_path.clone();
+        let backup_path = db_path.with_extension("db.backup");
+        if let Err(e) = std::fs::copy(&db_path_clone, &backup_path) {
+            return ToolResult::error(format!("Failed to create backup: {}", e));
+        }
+
+        // Wipe all derived data in a single transaction
+        {
+            let txn = match conn.unchecked_transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&backup_path);
+                    return ToolResult::error(format!("Txn error: {}", e));
+                }
+            };
+            if let Err(e) = txn.execute_batch(
+                "DELETE FROM chunk_embeddings; DELETE FROM graph_edges; DELETE FROM graph_nodes; DELETE FROM index_jobs; DELETE FROM chunks_fts; DELETE FROM chunks; DELETE FROM documents;"
+            ) {
+                let _ = std::fs::remove_file(&backup_path);
+                return ToolResult::error(format!("Wipe failed: {}", e));
+            }
+            if let Err(e) = txn.commit() {
+                let _ = std::fs::remove_file(&backup_path);
+                return ToolResult::error(format!("Wipe commit failed: {}", e));
+            }
+        }
+
+        // Rebuild via sync_all.
+        // sync_all does NOT open its own outer transaction, so there is no
+        // nested-transaction conflict. Each per-document insert uses its own
+        // short-lived BEGIN IMMEDIATE / COMMIT.
         match sync::sync_all(&conn, &bundle_root) {
-            Ok(results) => ToolResult::json(&results),
-            Err(e) => ToolResult::error(format!("Rebuild failed: {}", e)),
+            Ok(results) => {
+                // Check for partial failure: any root with failed > 0 means
+                // the index is incomplete and we should restore backup.
+                let has_failure = results.iter().any(|r| r.failed > 0);
+                if has_failure {
+                    drop(conn);
+                    let fail_roots: Vec<&str> = results
+                        .iter()
+                        .filter(|r| r.failed > 0)
+                        .map(|r| r.root_name.as_str())
+                        .collect();
+                    let _ = std::fs::copy(&backup_path, &db_path_clone);
+                    let _ = std::fs::remove_file(&backup_path);
+                    return ToolResult::error(format!(
+                        "Rebuild partially failed (roots: {:?}), old index restored",
+                        fail_roots
+                    ));
+                }
+                let _ = std::fs::remove_file(&backup_path);
+                ToolResult::json(&results)
+            }
+            Err(e) => {
+                // Restore old DB on total failure
+                drop(conn);
+                let _ = std::fs::copy(&backup_path, &db_path_clone);
+                let _ = std::fs::remove_file(&backup_path);
+                ToolResult::error(format!("Rebuild failed (old index restored): {}", e))
+            }
         }
     }
 }
@@ -427,17 +477,10 @@ impl Tool for ForgetDocumentTool {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("DB: {}", e)),
         };
-        let now = chrono::Utc::now().to_rfc3339();
-        let _ = conn.execute(
-            "UPDATE documents SET status='deleted', deleted_at=?1, updated_at=?1 WHERE id=?2",
-            rusqlite::params![now, doc_id],
-        );
-        let _ = fts::delete_doc(&conn, doc_id);
-        let _ = conn.execute("DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id=?1)", [doc_id]);
-        let _ = conn.execute("DELETE FROM chunks WHERE doc_id=?1", [doc_id]);
-        let _ = conn.execute("DELETE FROM graph_edges WHERE source_id IN (SELECT id FROM graph_nodes WHERE doc_id=?1) OR target_id IN (SELECT id FROM graph_nodes WHERE doc_id=?1)", [doc_id]);
-        let _ = conn.execute("DELETE FROM graph_nodes WHERE doc_id=?1", [doc_id]);
-        ToolResult::json(&serde_json::json!({"status":"ok","doc_id":doc_id}))
+        match crate::sync::indexer::delete_document(&conn, doc_id) {
+            Ok(()) => ToolResult::json(&serde_json::json!({"status":"ok","doc_id":doc_id})),
+            Err(e) => ToolResult::error(format!("{}", e)),
+        }
     }
 }
 
@@ -629,6 +672,7 @@ impl Tool for AskQuestionTool {
 
         let llm_config = if cfg.llm.enabled && !cfg.llm.api_key_env.is_empty() {
             let api_key = std::env::var(&cfg.llm.api_key_env).unwrap_or_default();
+            tracing::info!(llm_enabled=%cfg.llm.enabled, api_key_env=%cfg.llm.api_key_env, key_len=api_key.len(), "AskQuestion LLM check");
             if !api_key.is_empty() {
                 Some(rag::LlmConfig {
                     enabled: true,

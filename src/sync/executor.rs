@@ -29,7 +29,7 @@ pub struct ExecResult {
 pub fn execute_plan(
     conn: &Connection,
     root: &KnowledgeRoot,
-    _bundle_root: &Path,
+    bundle_root: &Path,
     root_path: &Path,
     plan: &SyncPlan,
 ) -> Result<ExecResult> {
@@ -38,15 +38,28 @@ pub fn execute_plan(
     let mut deleted = 0usize;
     let mut failed = 0usize;
 
+    // Read max file size from config
+    let max_file_size_bytes = crate::config::bundle::load_config(bundle_root)
+        .map(|cfg| cfg.app.max_file_size_mb * 1_048_576u64)
+        .unwrap_or(50u64 * 1_048_576u64);
+
     let root_id = ensure_root(conn, root, root_path)?;
     let parser_registry = ParserRegistry::default_registry();
     let chunk_config = chunker::ChunkConfig::default();
 
-    // Process creates
+    // Process creates (unified via indexer)
     for file in &plan.create {
-        match index_file(conn, &root_id, file, &parser_registry, &chunk_config) {
-            Ok(_) => {
+        match super::indexer::index_document(
+            conn,
+            &root_id,
+            file,
+            &parser_registry,
+            &chunk_config,
+            max_file_size_bytes,
+        ) {
+            Ok((_doc_id, chunk_ids)) => {
                 created += 1;
+                super::jobs::queue_embedding_jobs(conn, &_doc_id, &file.relative_path, &chunk_ids);
                 log_sync_event(conn, &root_id, "created", &file.relative_path, None)?;
             }
             Err(e) => {
@@ -63,12 +76,13 @@ pub fn execute_plan(
         }
     }
 
-    // Process modifies: delete old → rebuild in a transaction.
-    // If rebuild fails, the transaction rolls back and old data remains intact.
+    // Process modifies (unified via indexer)
     for file in &plan.modify {
-        match modify_file_transactional(conn, &root_id, file, &parser_registry, &chunk_config) {
-            Ok(()) => {
+        match super::indexer::modify_document(conn, &root_id, file, &parser_registry, &chunk_config)
+        {
+            Ok((_doc_id, chunk_ids)) => {
                 modified += 1;
+                super::jobs::queue_embedding_jobs(conn, &_doc_id, &file.relative_path, &chunk_ids);
                 log_sync_event(conn, &root_id, "modified", &file.relative_path, None)?;
             }
             Err(e) => {
@@ -107,6 +121,7 @@ pub fn execute_plan(
 
 /// Modify a file within an explicit SQLite transaction.
 /// If any step fails, the transaction rolls back and old data is preserved.
+#[allow(dead_code)]
 fn modify_file_transactional(
     conn: &Connection,
     root_id: &str,
@@ -246,9 +261,9 @@ pub fn reindex_document(conn: &Connection, doc_id: &str) -> Result<()> {
     )
 }
 
-/// Full indexing pipeline for a single file: parse → chunk → insert → FTS → graph.
-/// Each file is processed in its own implicit transaction (via individual SQL statements).
-/// A failure here returns an error that the caller can handle per-file.
+/// Full indexing pipeline: parse → chunk → transactional insert → FTS → graph.
+/// Cleanup: removes soft-deleted records before inserting new ones (file recovery).
+#[allow(dead_code)]
 fn index_file(
     conn: &Connection,
     root_id: &str,
@@ -256,6 +271,16 @@ fn index_file(
     parser_registry: &ParserRegistry,
     chunk_config: &chunker::ChunkConfig,
 ) -> Result<String> {
+    // 0. File size check (before reading anything)
+    let max_size = 50 * 1_048_576u64; // Default 50MB, overridden by config if available
+    if file.size > max_size {
+        return Err(anyhow::anyhow!(
+            "File exceeds max size limit ({}MB): {}",
+            max_size / 1_048_576,
+            file.relative_path
+        ));
+    }
+
     // 1. Determine file type and parse
     let ext = file
         .absolute_path
@@ -291,7 +316,11 @@ fn index_file(
         return insert_unindexed_document(conn, root_id, file, &ext);
     }
 
-    // 4. Compute hash and insert document
+    // 4. Clean up soft-deleted records, then insert document + chunks + FTS + graph
+    conn.execute(
+        "DELETE FROM documents WHERE root_id = ?1 AND relative_path = ?2 AND status = 'deleted'",
+        rusqlite::params![root_id, file.relative_path],
+    )?;
     let hash = compute_hash(&file.absolute_path)?;
     let doc_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -303,19 +332,7 @@ fn index_file(
         "INSERT INTO documents (id, root_id, source_path, relative_path, title, file_type,
          content_hash, source_mtime, source_size, status, word_count, created_at, updated_at, indexed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'indexed', ?10, ?11, ?11, ?11)",
-        rusqlite::params![
-            doc_id,
-            root_id,
-            source_path,
-            file.relative_path,
-            title,
-            file_type,
-            hash,
-            file.mtime,
-            file.size as i64,
-            word_count,
-            now,
-        ],
+        rusqlite::params![doc_id, root_id, source_path, file.relative_path, title, file_type, hash, file.mtime, file.size as i64, word_count, now],
     )?;
 
     // 5. Insert chunks + FTS
@@ -327,26 +344,11 @@ fn index_file(
             sha2::Digest::update(&mut h, &chunk.content);
             hex::encode(sha2::Digest::finalize(h))
         };
-
         conn.execute(
-            "INSERT INTO chunks (id, doc_id, chunk_index, heading_path, content, content_hash,
-             start_line, end_line, token_count, embedding_status, created_at)
+            "INSERT INTO chunks (id, doc_id, chunk_index, heading_path, content, content_hash, start_line, end_line, token_count, embedding_status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10)",
-            rusqlite::params![
-                chunk_id,
-                doc_id,
-                i as i64,
-                chunk.heading_path.join("/"),
-                chunk.content,
-                chunk_hash,
-                chunk.start_line as i64,
-                chunk.end_line as i64,
-                chunk.token_estimate as i64,
-                now,
-            ],
+            rusqlite::params![chunk_id, doc_id, i as i64, chunk.heading_path.join("/"), chunk.content, chunk_hash, chunk.start_line as i64, chunk.end_line as i64, chunk.token_estimate as i64, now],
         )?;
-
-        // FTS index
         let heading_str = chunk.heading_path.join(" > ");
         fts::index_chunk(
             conn,
@@ -359,62 +361,92 @@ fn index_file(
         chunk_ids.push(chunk_id.clone());
     }
 
-    // 6. Try embedding (non-fatal)
-    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    try_embed_chunks(conn, &chunk_ids, &chunk_texts);
-
-    // 7. Build graph
+    // 6. Build graph
     graph::build_document_graph(conn, &doc_id, &source_path, &parsed)?;
 
-    tracing::debug!(doc_id = %doc_id, chunks = chunks.len(), path = %file.relative_path, "Document indexed");
+    // Queue embedding as background job (non-blocking)
+    for _chunk_id in &chunk_ids {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let _ = conn.execute("INSERT INTO index_jobs (id, job_type, doc_id, source_path, status, attempts, created_at, updated_at) VALUES (?1, 'generate_embedding', ?2, ?3, 'pending', 0, ?4, ?4)", rusqlite::params![job_id, doc_id, source_path, now]);
+    }
 
+    tracing::debug!(doc_id = %doc_id, chunks = chunks.len(), path = %file.relative_path, "Document indexed");
     Ok(doc_id)
 }
 
 /// Insert a document without indexing (unsupported file type).
+/// All soft-delete cleanup and insert are done in a single transaction.
+#[allow(dead_code)]
 fn insert_unindexed_document(
     conn: &Connection,
     root_id: &str,
     file: &ScannedFile,
     ext: &str,
 ) -> Result<String> {
-    let hash = compute_hash(&file.absolute_path)?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let title = file
-        .absolute_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("untitled")
-        .to_string();
-    let source_path = file.absolute_path.display().to_string();
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<String> {
+        // Clean up any soft-deleted record with same path first (don't swallow errors)
+        conn.execute(
+            "DELETE FROM documents WHERE root_id = ?1 AND relative_path = ?2 AND status = 'deleted'",
+            rusqlite::params![root_id, file.relative_path],
+        )?;
 
-    conn.execute(
-        "INSERT INTO documents (id, root_id, source_path, relative_path, title, file_type,
-         content_hash, source_mtime, source_size, status, word_count, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', 0, ?10, ?10)",
-        rusqlite::params![
-            id,
-            root_id,
-            source_path,
-            file.relative_path,
-            title,
-            ext,
-            hash,
-            file.mtime,
-            file.size as i64,
-            now,
-        ],
-    )?;
+        let hash = compute_hash(&file.absolute_path)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let title = file
+            .absolute_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+            .to_string();
+        let source_path = file.absolute_path.display().to_string();
 
-    Ok(id)
+        conn.execute(
+            "INSERT INTO documents (id, root_id, source_path, relative_path, title, file_type,
+             content_hash, source_mtime, source_size, status, word_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', 0, ?10, ?10)",
+            rusqlite::params![
+                id,
+                root_id,
+                source_path,
+                file.relative_path,
+                title,
+                ext,
+                hash,
+                file.mtime,
+                file.size as i64,
+                now,
+            ],
+        )?;
+        Ok(id)
+    })();
+    match result {
+        Ok(id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(id)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
-/// Ensure the watched_root row exists.
+/// Ensure the watched_root row exists. Returns the real root_id.
 fn ensure_root(conn: &Connection, root: &KnowledgeRoot, root_path: &Path) -> Result<String> {
+    // Check if root already exists first (avoids INSERT OR IGNORE issues)
+    if let Ok(existing_id) = conn.query_row::<String, _, _>(
+        "SELECT id FROM watched_roots WHERE name = ?1",
+        rusqlite::params![root.name],
+        |r| r.get(0),
+    ) {
+        return Ok(existing_id);
+    }
+
+    // Insert new root
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-
     conn.execute(
         "INSERT OR IGNORE INTO watched_roots (id, name, root_path, enabled, read_only, include_globs, exclude_globs, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
@@ -435,7 +467,7 @@ fn ensure_root(conn: &Connection, root: &KnowledgeRoot, root_path: &Path) -> Res
     Ok(actual_id)
 }
 
-/// Soft-delete a document and its derived data.
+/// Soft-delete a document and its derived data — all in one transaction.
 fn soft_delete_document(conn: &Connection, root_id: &str, doc_ref: &DocumentRef) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -446,21 +478,28 @@ fn soft_delete_document(conn: &Connection, root_id: &str, doc_ref: &DocumentRef)
         |row| row.get(0),
     ).context("Document not found for deletion")?;
 
+    let txn = conn
+        .unchecked_transaction()
+        .context("Failed to begin delete transaction")?;
+
     // Soft-delete
-    conn.execute(
+    txn.execute(
         "UPDATE documents SET status = 'deleted', deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
         rusqlite::params![now, doc_id],
     )?;
 
     // Remove derived data
-    fts::delete_doc(conn, &doc_id)?;
-    conn.execute(
+    fts::delete_doc(&txn, &doc_id)?;
+    txn.execute(
         "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = ?1)",
         [&doc_id],
     )?;
-    conn.execute("DELETE FROM chunks WHERE doc_id = ?1", [&doc_id])?;
-    conn.execute("DELETE FROM graph_edges WHERE source_id IN (SELECT id FROM graph_nodes WHERE doc_id = ?1) OR target_id IN (SELECT id FROM graph_nodes WHERE doc_id = ?1)", [&doc_id])?;
-    conn.execute("DELETE FROM graph_nodes WHERE doc_id = ?1", [&doc_id])?;
+    txn.execute("DELETE FROM chunks WHERE doc_id = ?1", [&doc_id])?;
+    txn.execute("DELETE FROM graph_edges WHERE source_id IN (SELECT id FROM graph_nodes WHERE doc_id = ?1) OR target_id IN (SELECT id FROM graph_nodes WHERE doc_id = ?1)", [&doc_id])?;
+    txn.execute("DELETE FROM graph_nodes WHERE doc_id = ?1", [&doc_id])?;
+
+    txn.commit()
+        .context("Failed to commit delete transaction")?;
 
     Ok(())
 }
@@ -546,7 +585,10 @@ fn build_embedder() -> Option<crate::index::embed::RemoteEmbedder> {
 
 /// Content quality gate: rejects files that appear to be binary garbage.
 /// Files with >30% non-printable characters or zero meaningful words are rejected.
-fn check_content_quality(doc: &crate::ingest::ParsedDocument, path: &str) -> anyhow::Result<()> {
+pub(crate) fn check_content_quality(
+    doc: &crate::ingest::ParsedDocument,
+    path: &str,
+) -> anyhow::Result<()> {
     let text = &doc.plain_text;
     if text.is_empty() {
         return Ok(()); // empty files are fine

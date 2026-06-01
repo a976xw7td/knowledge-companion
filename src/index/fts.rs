@@ -1,9 +1,11 @@
-//! FTS5 full-text keyword search.
+//! FTS5 full-text keyword search with jieba CJK tokenization.
 
 use anyhow::Result;
 use rusqlite::Connection;
 
-/// Index a chunk in the FTS5 table.
+use super::tokenizer;
+
+/// Index a chunk in the FTS5 table. Title, heading, and content are tokenized for CJK support.
 pub fn index_chunk(
     conn: &Connection,
     chunk_id: &str,
@@ -12,9 +14,12 @@ pub fn index_chunk(
     heading: &str,
     content: &str,
 ) -> Result<()> {
+    let tt = tokenizer::tokenize_for_fts(title);
+    let th = tokenizer::tokenize_for_fts(heading);
+    let tc = tokenizer::tokenize_for_fts(content);
     conn.execute(
         "INSERT INTO chunks_fts (chunk_id, doc_id, title, heading, content) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![chunk_id, doc_id, title, heading, content],
+        rusqlite::params![chunk_id, doc_id, tt, th, tc],
     )?;
     Ok(())
 }
@@ -25,12 +30,13 @@ pub fn delete_doc(conn: &Connection, doc_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Search FTS5 with BM25 ranking.
+/// Search FTS5 with BM25 ranking. Query is tokenized for CJK support.
 pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
-    // Sanitize query for FTS5: strip special chars that cause syntax errors.
-    // FTS5 special: * prefix wildcard, " phrase, - NOT, () grouping, : column filter.
-    // Strategy: strip all problematic chars, then tokenize with wildcard suffix.
-    let sanitized: String = query
+    // Tokenize CJK query first, then build FTS query
+    let tokenized = tokenizer::tokenize_for_fts(query);
+
+    // Sanitize: strip problematic FTS5 special chars
+    let sanitized: String = tokenized
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '*' || *c == '-')
         .collect();

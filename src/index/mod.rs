@@ -5,4 +5,5 @@
 pub mod embed;
 pub mod fts;
 pub mod graph;
+pub mod tokenizer;
 pub mod vector;

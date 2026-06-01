@@ -65,11 +65,23 @@ enum Commands {
     Info,
     /// Trigger manual sync of all watched roots
     Sync,
+    /// Embedded job management
+    #[command(subcommand)]
+    Jobs(JobCommand),
     /// Start HTTP MCP server (requires [http_mcp] enabled=true in config)
     #[command(name = "serve-http")]
     ServeHttp,
     /// Watch knowledge roots for file changes and auto-sync
     Watch,
+}
+
+#[derive(Subcommand)]
+enum JobCommand {
+    /// Show embedding job statistics
+    Status,
+    /// Process one batch of pending embedding jobs
+    #[command(name = "run-once")]
+    RunOnce,
 }
 
 #[derive(Subcommand)]
@@ -106,6 +118,7 @@ fn main() -> Result<()> {
         Commands::Db { action } => cmd_db(&bundle_root, action, cli.json),
         Commands::Info => cmd_info(&bundle_root, cli.json),
         Commands::Sync => cmd_sync(&bundle_root, cli.json),
+        Commands::Jobs(cmd) => cmd_jobs(&bundle_root, cmd, cli.json),
         Commands::ServeHttp => cmd_serve_http(&bundle_root),
         Commands::Watch => cmd_watch(&bundle_root),
     }
@@ -399,7 +412,7 @@ fn cmd_watch(bundle_root: &std::path::Path) -> Result<()> {
     println!("Press Ctrl+C to stop.");
     println!();
 
-    knowledge_companion::sync::watcher::watch_all(2000, move || {
+    knowledge_companion::sync::watcher::watch_all(5000, move || {
         if let Ok(conn) = knowledge_companion::db::connection::open(&db_path) {
             match knowledge_companion::sync::sync_all(&conn, &root_clone) {
                 Ok(results) => {
@@ -419,4 +432,130 @@ fn cmd_watch(bundle_root: &std::path::Path) -> Result<()> {
 
     std::thread::park();
     Ok(())
+}
+
+fn cmd_jobs(bundle_root: &std::path::Path, cmd: JobCommand, json: bool) -> Result<()> {
+    let cfg = config::bundle::load_config(bundle_root).unwrap_or_default();
+    let db_path = config::bundle::resolve_path(bundle_root, &cfg.storage.db_path);
+    let conn = knowledge_companion::db::connection::open(&db_path).context("DB open")?;
+
+    match cmd {
+        JobCommand::Status => {
+            let stats = knowledge_companion::sync::jobs::job_stats(&conn)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!("Embedding Jobs:");
+                if let Some(p) = stats.get("pending") {
+                    println!("  pending:    {}", p);
+                }
+                if let Some(p) = stats.get("processing") {
+                    println!("  processing: {}", p);
+                }
+                if let Some(p) = stats.get("completed") {
+                    println!("  completed:  {}", p);
+                }
+                if let Some(p) = stats.get("failed") {
+                    println!("  failed:     {}", p);
+                }
+            }
+        }
+        JobCommand::RunOnce => {
+            println!("Processing one batch of embedding jobs...");
+            let jobs = knowledge_companion::sync::jobs::claim_pending_jobs(&conn, 8)?;
+            if jobs.is_empty() {
+                println!("No pending jobs.");
+                return Ok(());
+            }
+            println!("Claimed {} jobs", jobs.len());
+            // Process each job
+            for job in &jobs {
+                knowledge_companion::sync::jobs::mark_job_started(&conn, &job.id)?;
+                let chunk_id = &job.chunk_id;
+                // Get chunk content
+                let content: Option<String> = conn
+                    .query_row("SELECT content FROM chunks WHERE id=?1", [chunk_id], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+                if let Some(text) = content {
+                    match build_embedder_for_jobs(bundle_root) {
+                        Some(embedder) => match embedder.embed_sync(&[text]) {
+                            Ok(embeddings) => {
+                                if let Some(emb) = embeddings.first() {
+                                    if let Err(e) =
+                                        knowledge_companion::index::vector::store_embedding(
+                                            &conn, chunk_id, emb,
+                                        )
+                                    {
+                                        eprintln!("  FAIL {}: {}", &job.id[..8], e);
+                                        knowledge_companion::sync::jobs::mark_job_failed(
+                                            &conn,
+                                            &job.id,
+                                            &format!("Store: {}", e),
+                                            3,
+                                        )?;
+                                    } else {
+                                        knowledge_companion::sync::jobs::mark_job_done(
+                                            &conn, &job.id, chunk_id,
+                                        )?;
+                                        println!("  OK   {}", &job.id[..8]);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  RETRY {}: {}", &job.id[..8], e);
+                                knowledge_companion::sync::jobs::mark_job_failed(
+                                    &conn,
+                                    &job.id,
+                                    &format!("API: {}", e),
+                                    3,
+                                )?;
+                            }
+                        },
+                        None => {
+                            knowledge_companion::sync::jobs::mark_job_failed(
+                                &conn,
+                                &job.id,
+                                "No embedder config",
+                                3,
+                            )?;
+                        }
+                    }
+                } else {
+                    knowledge_companion::sync::jobs::mark_job_failed(
+                        &conn,
+                        &job.id,
+                        "Chunk not found",
+                        3,
+                    )?;
+                }
+            }
+            println!("Done.");
+        }
+    }
+    Ok(())
+}
+
+fn build_embedder_for_jobs(
+    bundle_root: &std::path::Path,
+) -> Option<knowledge_companion::index::embed::RemoteEmbedder> {
+    let config = config::bundle::load_config(bundle_root).ok()?;
+    if !config.embedding.enabled || config.embedding.api_key_env.is_empty() {
+        return None;
+    }
+    let key = std::env::var(&config.embedding.api_key_env).ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(knowledge_companion::index::embed::RemoteEmbedder::new(
+        knowledge_companion::index::embed::EmbedConfig {
+            base_url: config.embedding.base_url,
+            api_key: key,
+            model: config.embedding.model,
+            dimensions: config.embedding.dimensions,
+            timeout_seconds: config.embedding.timeout_seconds,
+            batch_size: config.embedding.batch_size,
+        },
+    ))
 }

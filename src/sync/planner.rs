@@ -36,11 +36,14 @@ pub struct DocumentRef {
 /// Uses `relative_path` as the stable join key. The `source_path` (absolute
 /// path) may change between runs (USB mounted at different paths), but
 /// `relative_path` is invariant as long as the watched root path is consistent.
+///
+/// `max_file_size_bytes` skips files that exceed the size limit (from config).
 pub fn build_plan(
     conn: &Connection,
     root: &KnowledgeRoot,
     _root_path: &Path,
     scanned: &[ScannedFile],
+    max_file_size_bytes: u64,
 ) -> Result<SyncPlan> {
     let mut create = Vec::new();
     let mut modify = Vec::new();
@@ -80,19 +83,26 @@ pub fn build_plan(
 
     // Determine creates, modifies, and skips
     for file in scanned {
+        // Skip files exceeding size limit — don't even read them for hashing
+        if file.size > max_file_size_bytes {
+            tracing::warn!(
+                path = %file.relative_path,
+                size = file.size,
+                limit = max_file_size_bytes,
+                "File exceeds max size, skipping"
+            );
+            skip += 1;
+            continue;
+        }
+
         match db_files.get(&file.relative_path) {
             None => {
                 // Not in DB → create
                 create.push(file.clone());
             }
-            Some((_id, db_hash, db_mtime, db_size)) => {
-                // In DB → check for changes (fast path: mtime + size)
-                if *db_mtime == file.mtime && *db_size == file.size as i64 {
-                    skip += 1;
-                    continue;
-                }
-
-                // Slow path: compute hash
+            Some((_id, db_hash, _db_mtime, _db_size)) => {
+                // Always compute hash for correctness. mtime may be unchanged
+                // on fast equal-length edits within the same second.
                 let file_hash = match compute_hash(&file.absolute_path) {
                     Ok(h) => h,
                     Err(_) => {
